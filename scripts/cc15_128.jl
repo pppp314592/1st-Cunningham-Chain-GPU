@@ -8,7 +8,7 @@ HI_MAX = Int128(10)^19
 LOG_FILE = "logs/cc15_128_progress.log"
 RESULT_FILE = "logs/cc15_128_results.txt"
 
-START = Int128(9_223_372_036_854_775_808)  # Int64上限の次の数から
+START = Int128(9_723_372_036_854_775_808)  # 5バッチ分スキップ
 
 function log_msg(msg)
     ts = now()
@@ -30,9 +30,9 @@ function main()
 
     t_start = time()
     found = Int128[]
-    batch = 1
-    r = START + STEP
-    total_batches = (HI_MAX - r) ÷ STEP
+    batch = 5
+    r = START
+    total_batches = 8
 
     while r < HI_MAX
         batch += 1
