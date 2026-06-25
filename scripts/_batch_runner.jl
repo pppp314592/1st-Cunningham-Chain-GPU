@@ -5,8 +5,8 @@ using Dates
 TARGET_CC = 15
 STEP = 10^16
 HI_MAX = 9_220_000_000_000_000_000
-LOG_FILE = "../logs/cc15_progress.log"
-RESULT_FILE = "../logs/cc15_results.txt"
+LOG_FILE = "logs/cc15_progress.log"
+RESULT_FILE = "logs/cc15_results.txt"
 
 function log_msg(msg)
     ts = now()
