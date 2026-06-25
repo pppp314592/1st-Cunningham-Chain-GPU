@@ -4,7 +4,7 @@ using Dates
 
 TARGET_CC = 15
 STEP = Int128(10)^17
-HI_MAX = Int128(10)^21
+HI_MAX = Int128(10)^19
 LOG_FILE = "logs/cc15_128_progress.log"
 RESULT_FILE = "logs/cc15_128_results.txt"
 
