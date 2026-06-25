@@ -17,16 +17,6 @@ function log_msg(msg)
     flush(stdout)
 end
 
-function fmt(n)
-    s = string(n)
-    r = ""
-    for (i, c) in enumerate(reverse(s))
-        i > 1 && (i-1) % 3 == 0 && (r = "," * r)
-        r = c * r
-    end
-    return r
-end
-
 function main()
     open(LOG_FILE, "a") do f
         println(f, "[$(now())] --- resume ---")
@@ -38,8 +28,8 @@ function main()
 
     t_start = time()
     found = Int[]
-    batch = 230
-    r = 3_300_000_000_000_000_000
+    batch = 401
+    r = 5_010_000_000_000_000_000
     total_batches = (HI_MAX - 10^18) ÷ STEP
 
     while r < HI_MAX
@@ -66,7 +56,7 @@ function main()
         eta_min = round(Int, eta_s / 60)
 
         log_msg(
-            "[$(batch)/$(total_batches)] $(fmt(r))-$(fmt(r_end)) | $(round(t_batch, digits=1))s | " *
+            "[$(batch)/$(total_batches)] $(r)-$(r_end) | $(round(t_batch, digits=1))s | " *
             "found=$(length(res)) total=$cumul | " *
             "elapsed=$(elapsed)s ETA=$(eta_min)min $(pct)%"
         )
