@@ -8,7 +8,7 @@ HI_MAX = Int128(10)^20
 LOG_FILE = "logs/cc15_128_10-10^20_progress.log"
 RESULT_FILE = "logs/cc15_128_10-10^20_results.txt"
 
-START = Int128(10)
+START = length(ARGS) >= 1 ? parse(Int128, ARGS[1]) : Int128(10)
 
 function log_msg(msg)
     ts = now()
@@ -35,6 +35,7 @@ function main()
     batch = 0
     r = START
     total_batches = cld(HI_MAX - START, STEP)
+    log_msg("Resuming from $r, remaining batches: $total_batches")
 
     while r < HI_MAX
         batch += 1
