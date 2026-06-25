@@ -28,18 +28,18 @@ function fmt(n)
 end
 
 function main()
-    open(LOG_FILE, "w") do f
-        println(f, "[$(now())] CC15 search started")
+    open(LOG_FILE, "a") do f
+        println(f, "[$(now())] --- resume ---")
+        println(f, "[$(now())] CC15 search resumed")
         println(f, "[$(now())] range: 10^18 - $(HI_MAX)")
         println(f, "[$(now())] batch size: $STEP")
         println(f, "[$(now())] threads: $(Threads.nthreads())")
     end
-    open(RESULT_FILE, "w") do f end
 
     t_start = time()
     found = Int[]
-    batch = 0
-    r = 10^18
+    batch = 230
+    r = 3_300_000_000_000_000_000
     total_batches = (HI_MAX - 10^18) ÷ STEP
 
     while r < HI_MAX

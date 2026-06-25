@@ -15,7 +15,7 @@ function run_search()
     t_start = time()
     found = Int[]
     batch = 0
-    r = 10^18
+    r = 3_300_000_000_000_000_000
 
     while r < HI_MAX
         batch += 1
