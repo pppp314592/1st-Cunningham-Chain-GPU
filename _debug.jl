@@ -1,0 +1,6 @@
+include("cc_gpu.jl")
+println("precomp ok")
+wheel, wheel_n, mdllist = build_cc_sieve(15)
+println("sieve ok: wheel=$wheel")
+res = search_cc_gpu(10^18, 10^18+10^15, 15, verbose=true)
+println("done: $(length(res))")
