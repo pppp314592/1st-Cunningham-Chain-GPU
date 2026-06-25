@@ -8,7 +8,7 @@ HI_MAX = Int128(10)^21
 LOG_FILE = "logs/cc15_128_progress.log"
 RESULT_FILE = "logs/cc15_128_results.txt"
 
-START = Int128(10)^20  # known CC15 ~9e19 の直上から
+START = Int128(10)^19  # Int64上限 (9.22e18) の直上から
 
 function log_msg(msg)
     ts = now()
