@@ -30,8 +30,8 @@ function main()
 
     t_start = time()
     found = Int128[]
-    batch = 0
-    r = START
+    batch = 1
+    r = START + STEP
     total_batches = (HI_MAX - r) ÷ STEP
 
     while r < HI_MAX
