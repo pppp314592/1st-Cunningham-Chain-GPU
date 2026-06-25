@@ -1,4 +1,4 @@
-include("cc_gpu.jl")
+include("../src/cc_gpu.jl")
 println("precomp ok")
 wheel, wheel_n, mdllist = build_cc_sieve(15)
 println("sieve ok: wheel=$wheel")

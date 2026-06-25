@@ -1,7 +1,7 @@
-include("prime_filter.jl")
+include("../src/prime_filter.jl")
 using Primes
 
-println("=== 10^7 〜 10^8 ===")
+println("=== 10^7 、E10^8 ===")
 arr = collect(10^7:10^8)
 gpu_cnt = length(filter_primes(arr))
 cpu_cnt = length(primes(10^7, 10^8))

@@ -1,10 +1,10 @@
-include("cc_gpu.jl")
+include("../src/cc_gpu.jl")
 
 # 1回目 (コンパイル込み)
 t1 = @elapsed res1 = search_cc_gpu(10^18, 10^18 + 10^16, 15, verbose=false)
 println("1回目: $(length(res1)) 件, $(round(t1, digits=1))s")
 
-# 2回目 (キャッシュ済み)
+# 2回目 (キャチE��ュ済み)
 t2 = @elapsed res2 = search_cc_gpu(10^18 + 10^16, 10^18 + 2*10^16, 15, verbose=false)
 println("2回目: $(length(res2)) 件, $(round(t2, digits=1))s")
 

@@ -1,4 +1,4 @@
-include("cc_gpu.jl")
+include("../src/cc_gpu.jl")
 using Primes
 
 n = Int128(90616211958465842219)
@@ -22,7 +22,7 @@ x_lo = UInt64(n & 0xFFFFFFFFFFFFFFFF)
 x_hi = UInt64((n >> 64) & 0xFFFFFFFFFFFFFFFF)
 cnt = _cc_count128(x_lo, x_hi, 15)
 println("\n_cc_count128 result: chain length = $cnt")
-println("  => $(cnt >= 15 ? "CC15 CONFIRMED ✓" : "NOT CC15 ✗")")
+println("  => $(cnt >= 15 ? "CC15 CONFIRMED ✁E : "NOT CC15 ✁E)")
 
 println("\nVerification with Primes.jl:")
 x = n
