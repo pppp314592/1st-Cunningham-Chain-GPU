@@ -28,3 +28,6 @@ Stacktrace:
  [12] _start()
     @ Base .\client.jl:550
 in expression starting at C:\Users\bab20\OneDrive\Documents\AnySource\opencode\project02\scripts\_batch_runner.jl:92
+┌ Error: You are using CUDA 13.1.0, but CUDA.jl was precompiled for CUDA 13.0.0.
+│ This is unexpected; please file an issue.
+└ @ CUDA C:\Users\bab20\.julia\packages\CUDA\x8d2s\src\initialization.jl:148
