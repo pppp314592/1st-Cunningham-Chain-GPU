@@ -173,10 +173,13 @@ julia -t 12 bench_cc13.jl
 `search_cc_gpu128` により 10〜10^20 の CC15 をバッチ (10^17刻み) で全数探索。
 - コマンドライン引数で開始位置を指定可能 (`julia scripts/cc15_128_10-10^20.jl <start>`)
 
-**実行方法:** PowerShell `Start-Job` でバックグラウンド実行
+**実行方法:** 新しいPowerShellウィンドウで直接実行（推奨）
 ```powershell
-$job = Start-Job -ScriptBlock { param($dir) Set-Location $dir; julia scripts/cc15_128_10-10^20.jl <start> } -ArgumentList (Get-Location).Path
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '<CWD>'; julia scripts/cc15_128_10-10^20.jl <start>"
 ```
+※ `Start-Job` はジョブが消えやすく、GPUアクセスに問題が出る場合があるため非推奨。
+
+**進捗確認:**
 
 **進捗確認:**
 ```powershell
@@ -185,8 +188,9 @@ Get-Content logs/cc15_128_10-10^20_progress.log -Tail 3
 
 **状態:**
 - 最初の 45バッチ (10〜4.5e18) 完了 → 中断 → 再開
-- 176バッチ (8e18〜2.56e19) 完了 → タイムアウト → PowerShell Start-Job でバックグラウンド実行中 (Job ID=1)
+- 176バッチ (8e18〜2.56e19) 完了 → タイムアウト → Start-Process で再実行
 - 各バッチ ~157秒、~21時間/1000バッチ
+- 最終更新: ~2.92e19 完了 (36/744), 発見0, ETA ~31時間
 
 ### 2025-06-26: GitHub 公開
 
