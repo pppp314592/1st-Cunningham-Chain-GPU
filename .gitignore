@@ -1,0 +1,14 @@
+# logs: keep only STATUS.md and result logs
+logs/*
+!logs/STATUS.md
+!logs/*found.log
+!logs/*results.txt
+!logs/summary.txt
+
+# checkpoints / temp
+*.ckpt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
