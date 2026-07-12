@@ -10,19 +10,22 @@ using Base.Threads
 # ============================================================
 
 function mulmod_cpu(a::Int64, b::Int64, m::Int64)::Int64
-    r = Int64(0)
-    aa = a % m
-    bb = b % m
+    # UInt64 で累算し符号オーバーフローを回避 (m が 2^62 超で Int64 累算は破綻するため)。
+    # 前提: 0 < m < 2^63。a%m, b%m は非負 < m。r+aa, aa+aa は < 2^64 で UInt64 に収まる。
+    r = UInt64(0)
+    aa = UInt64(a % m)
+    bb = UInt64(b % m)
+    mm = UInt64(m)
     while bb > 0
         if bb & 1 == 1
             r += aa
-            if r >= m; r -= m; end
+            if r >= mm; r -= mm; end
         end
         aa += aa
-        if aa >= m; aa -= m; end
+        if aa >= mm; aa -= mm; end
         bb >>= 1
     end
-    return r
+    return Int64(r)
 end
 
 function powermod_cpu(base::Int64, exp::Int64, mod::Int64)::Int64
