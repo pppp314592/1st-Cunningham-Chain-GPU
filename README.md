@@ -13,6 +13,60 @@ n, 2n+1, 4n+3, …, 2^(k-1)·n + (2^(k-1)-1)
 
 ---
 
+## 使い方（クイックスタート）
+
+すべて `scan.jl` 一本で走る。**必ず `-g0` を付ける**（非 ASCII フォルダパスのため）。
+
+```powershell
+# 基本形
+julia -g0 -t 12 scan.jl <k> <start> <width> [chunk] [ext|stream] [--fresh]
+```
+
+### よく使う例（コピペ可）
+
+```powershell
+# 1) 試走：CC15 を [2, 1e18) だけ軽く走らせて動作確認
+julia -g0 -t 12 scan.jl 15 2 1000000000000000000
+
+# 2) 既知最小付近を確認：CC16 の最小値 8.1e20 を含む帯域
+julia -g0 -t 12 scan.jl 16 810000000000000000000 10000000000000000000
+
+# 3) 最小値を確定する全探索：CC16 を [1e20, 8.1e20) まで
+julia -g0 -t 12 scan.jl 16 100000000000000000000 710433818265726529160
+```
+
+- **中断しても大丈夫**: `--fresh` を付けずに同じコマンドを再実行すると
+  `logs/scan_k<k>.ckpt` から**自動再開**する（完了済み範囲はスキップ）。
+  最初からやり直すには `--fresh` を付ける。
+- **結果の確認**:
+  - 検証済みの発見 → `logs/scan_k<k>.found.log`
+  - 進捗（%/ETA/発見数）→ `logs/scan_k<k>.run.log`
+  - 再開カーソル → `logs/scan_k<k>.ckpt`（3行目）
+- 発見した鎖は CPU で独立検証されてから found.log に記録される。
+
+### 引数リファレンス
+
+| 引数 | 意味 |
+|---|---|
+| `k` | 鎖の長さ（例: 15, 16） |
+| `start` | 探索開始の n（Int128、大きい数は `1000000000000000000` のように記述） |
+| `width` | 探索幅（start から start+width まで） |
+| `chunk` | （省略可）チャンク幅。省略時は `max(wheel, width÷50)` |
+| `ext` / `stream` | （省略可）手法。既定 `ext`。大レンジほど `stream` が有利 |
+| `--fresh` | （省略可）チェックポイントを無視して最初から |
+
+> `ext`（既定）: 29 追加ホイール、n < 9.06e23 まで。
+> `stream`: 巨大ホイール (6.15e17)、width ≫ 6e17 で ~1.3–2× 高速、n < 1.3e27 まで。
+
+### テスト（正当性確認）
+
+```powershell
+julia -g0 -t 12 tests/test_gpu_wheel.jl    # 14/14 PASS
+julia -g0 -t 12 tests/test_gpu_stream.jl   # 8/8 PASS
+```
+
+---
+
 ## 成果（最小の先頭 n）
 
 | k (鎖長) | 最小の先頭 n | 備考 |
@@ -51,44 +105,18 @@ CC15 は `scan.jl` で n=2 から昇順に全探索（`[2, 9.06e19]`: 10.91h、`
 
 ---
 
-## 使い方
-
-```powershell
-# 本番走査スクリプト（チャンク分割 + チェックポイント/再開 + CPU 独立検証）
-julia -g0 -t 12 scan.jl <k> <start> <width> [chunk] [ext|stream] [--fresh]
-
-# 例: CC15 を [2, 1e18) だけ試走
-julia -g0 -t 12 scan.jl 15 2 1000000000000000000
-
-# 例: CC16 を既知最小付近の帯域で確認
-julia -g0 -t 12 scan.jl 16 810000000000000000000 10000000000000000000
-```
-
-- 中断しても `--fresh` なしで再実行すれば `logs/scan_k<k>.ckpt` から自動再開。
-- 発見した鎖は CPU (`verify_cc`) で独立検証してから `logs/scan_k<k>.found.log` に記録。
-- `ext`（既定）: 29 追加ホイール、n < 9.06e23。
-  `stream`: 巨大ホイール、width ≫ 6e17 で ~1.3–2×、n < 1.3e27。
-
-### テスト
-```powershell
-julia -g0 -t 12 tests/test_gpu_wheel.jl    # 14/14 PASS
-julia -g0 -t 12 tests/test_gpu_stream.jl   # 8/8 PASS
-```
-
----
-
 ## ディレクトリ構成
 
 | パス | 内容 |
 |---|---|
-| `src/cc_gpu_wheel.jl` | GPU 融合 + hot/cold 分割カーネル（ext / stream 両経路） |
-| `src/cc_cpu.jl` | CPU リファレンス・独立検証（`mulmod_cpu` 等） |
-| `src/prime_filter.jl` | デバイス MR (`is_prime_mr128`) + Barrett 還元 (`bmod`) |
-| `scan.jl` | 本番走査（チェックポイント付き） |
-| `exp_*.jl` | 各種最適化の測定スクリプト |
+| `src/` | 本命カーネル実装（`cc_gpu_wheel.jl` 融合+hot/cold分割, `cc_cpu.jl` CPU参照, `prime_filter.jl` デバイスMR+Barrett） |
+| `scan.jl` | 本番走査（チャンク分割・チェックポイント付き、メイン入口） |
+| `util_scan.jl` | 走査用ユーティリティ |
+| `bench/` | ベンチマーク系スクリプト（`bench_*.jl`） |
+| `exp/` | 最適化測定・検証用スクリプト（`exp_*.jl`） |
+| `verify/` | 個別検証・小テスト・補助走査スクリプト |
 | `tests/` | GPU 正当性テスト |
-| `logs/STATUS.md` | 作業ステータス・計測結果の詳細 |
-| `logs/scan_k<k>.found.log` | 検証済み発見鎖 |
+| `logs/` | `STATUS.md`（詳細ステータス）、`scan_k<k>.found.log`（発見）、`scan_k<k>.run.log`（進捗）、`scan_k<k>.ckpt`（再開点） |
 | `algorithms/` | 別セッションの CPU バケット篩実験（GPU 本流とは独立） |
 
 ---
