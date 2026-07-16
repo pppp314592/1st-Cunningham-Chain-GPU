@@ -1,4 +1,4 @@
-# cc_gpu_wheel.jl — 融合GPUホイール篩
+﻿# cc_gpu_wheel.jl — 融合GPUホイール篩
 # 1スレッド=1ホイール候補。追加素数篩 + 鎖MR判定をカーネル内で完結し、
 # 確定した第一種カニンガム鎖の先頭値だけを書き戻す。
 #
@@ -789,5 +789,687 @@ function search_cc_gpu_wheel_stream128(lo::Integer, hi::Integer, k::Int;
     r = gpu_wheel_scan_stream128!(st, Int128(lo), Int128(hi);
                                   work_tile=work_tile, progress=progress)
     verbose && println("=== GPU-stream128 CC$k: $(length(r)) in $(round(time()-t0,digits=3))s ===")
+    return r
+end
+
+# ============================================================
+# 第二種カニンガム鎖 (p, 2p-1, 4p-3, ...) の GPU ホイール篩
+#   第一種との唯一の違いは鎖進行が x -> 2x - 1 (下位ビットが 0 になる) であること。
+#   篩 bad 残基も y -> 2y - 1 で計算。カーネル/setup/scan は全て *_2 別名で複製。
+# ============================================================
+
+# 任意 wl から wheel 生存残基を生成 (第二種: 2y-1)
+function build_wheel_custom_2(k::Int, wl::Vector{Int})
+    cc_len_mod(x, p) = (n = 0; y = x; while n < k && y % p != 0; y = (2y - 1) % p; n += 1; end; n)
+    wheel_n = Int[1]; pprod = 1
+    for p in wl
+        bad = Set(i for i in 0:p-1 if cc_len_mod(i, p) < k)
+        tmp = wheel_n; wheel_n = Int[]
+        sizehint!(wheel_n, length(tmp) * (p - length(bad)))
+        for i in 0:p-1
+            @inbounds for x in tmp
+                v = x + i * pprod
+                (v % p) in bad || push!(wheel_n, v)
+            end
+        end
+        pprod *= p
+    end
+    return prod(wl), wheel_n
+end
+
+# 追加素数の bad 残差リスト (第二種: 2y-1)
+function gpu_build_extra_2(k::Int, max_prime::Int; wl::Vector{Int} = _cc_wl(k))
+    @assert max_prime < 46340 "max_prime は 46340 未満に (Int32 32bit演算の制約)"
+    function cc_len_mod(x::Int, p::Int)::Int
+        n = 0; y = x
+        while n < k && y % p != 0
+            y = (2y - 1) % p; n += 1
+        end
+        return n
+    end
+    extra = filter(p -> !(p in wl) && p <= max_prime, primes(max_prime))
+    return [(p, Set(i for i in 0:p-1 if cc_len_mod(i, p) < k)) for p in extra]
+end
+
+# ストリーミング用 CRT 寄与 (第二種: 2y-1)
+function build_wheel_streaming_2(k::Int, wl::Vector{Int})
+    function cc_len_mod(x::Int, p::Int)::Int
+        n = 0; y = x
+        while n < k && y % p != 0
+            y = (2y - 1) % p; n += 1
+        end
+        return n
+    end
+    wheel128 = prod(Int128, wl)
+    @assert wheel128 < (Int128(1) << 60) "wheel exceeds 2^60 (3-limb 篩の前提が崩れる)"
+    goods = [[i for i in 0:p-1 if cc_len_mod(i, p) >= k] for p in wl]
+    bases = Int64[length(g) for g in goods]
+    R = prod(bases)
+    radixprod = Int64[]; acc = Int64(1)
+    for b in bases
+        push!(radixprod, acc); acc *= b
+    end
+    contrib_flat = Int64[]; contrib_off = Int32[]; off = 0
+    for (j, p) in enumerate(wl)
+        M = wheel128 ÷ Int128(p)
+        y = Int128(invmod(Int64(M % Int128(p)), p))
+        coef = mod(M * y, wheel128)
+        push!(contrib_off, Int32(off))
+        for a in goods[j]
+            push!(contrib_flat, Int64(mod(Int128(a) * coef, wheel128)))
+        end
+        off += length(goods[j])
+    end
+    return Int64(wheel128), contrib_flat, contrib_off, bases, radixprod, R
+end
+# 融合カーネル (第二種) — 64bit 頭 : 鎖進行 x = 2x - 1
+function _cc_wheel_kernel_2!(out::CuDeviceVector{Int64},
+                            counter::CuDeviceVector{Int32}, cap::Int32,
+                            d_wheel_n::CuDeviceVector{Int64}, R::Int64,
+                            wheel::Int64, k_base::Int64, ncyc::Int64,
+                            lo::Int64, hi::Int64,
+                            d_primes::CuDeviceVector{Int32},
+                            d_wheel_mod::CuDeviceVector{Int32},
+                            d_pow20::CuDeviceVector{Int32},
+                            d_mu::CuDeviceVector{UInt32},
+                            d_bad_off::CuDeviceVector{Int32},
+                            d_bad::CuDeviceVector{UInt8}, nprimes::Int32,
+                            kk::Int32)
+    g = (blockIdx().x - Int64(1)) * blockDim().x + threadIdx().x
+    total = ncyc * R
+    if g <= total
+        cyc = k_base + (g - Int64(1)) ÷ R
+        ridx = (g - Int64(1)) % R + Int64(1)
+        @inbounds r = d_wheel_n[ridx]
+        n = cyc * wheel + r
+        if n > lo && n < hi
+            r_hi = UInt32((r >> 20) & 0x7FFFFFFF)
+            r_lo = UInt32(r & 0x00000000000FFFFF)
+            cyc32 = UInt32(cyc & 0x7FFFFFFF)
+            ok = true
+            @inbounds for pi in 1:nprimes
+                p = UInt32(d_primes[pi])
+                Int64(p) >= n && break
+                mu = d_mu[pi]
+                rhp = bmod(r_hi, p, mu)
+                rp = bmod(rhp * UInt32(d_pow20[pi]) + r_lo, p, mu)
+                cp = bmod(cyc32, p, mu)
+                np = bmod(cp * UInt32(d_wheel_mod[pi]) + rp, p, mu)
+                if d_bad[d_bad_off[pi] + Int64(np) + Int64(1)] != 0x00
+                    ok = false; break
+                end
+            end
+            if ok
+                x_lo = reinterpret(UInt64, n)
+                x_hi = UInt64(0)
+                good = true
+                @inbounds for _ in 1:kk
+                    isp = if x_hi == UInt64(0) && x_lo <= 0x7FFFFFFFFFFFFFFF
+                        is_prime_mr(Int64(x_lo))
+                    else
+                        (x_hi > 0x7FFFFFFFFFFFFFFF) ? false : is_prime_mr128(x_lo, x_hi)
+                    end
+                    if !isp
+                        good = false; break
+                    end
+                    carry = (x_lo > 0x7FFFFFFFFFFFFFFF) ? UInt64(1) : UInt64(0)
+                    x_lo = x_lo << 1
+                    x_hi = (x_hi << 1) | carry
+                    if x_lo == UInt64(0)
+                        x_lo = 0xFFFFFFFFFFFFFFFF
+                        x_hi -= UInt64(1)
+                    else
+                        x_lo -= UInt64(1)
+                    end
+                end
+                if good
+                    idx = CUDA.atomic_add!(pointer(counter, 1), Int32(1)) + Int32(1)
+                    if idx <= cap
+                        @inbounds out[idx] = n
+                    end
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+# 融合カーネル (第二種, Int128 頭)
+function _cc_wheel_kernel128_2!(out::CuDeviceVector{Int128},
+                            counter::CuDeviceVector{Int32}, cap::Int32,
+                            d_wheel_n::CuDeviceVector{Int64}, R::Int64,
+                            wheel::Int64, k_base::Int64, ncyc::Int64,
+                            lo::Int128, hi::Int128,
+                            d_primes::CuDeviceVector{Int32},
+                            d_wheel_mod::CuDeviceVector{Int32},
+                            d_pow20::CuDeviceVector{Int32},
+                            d_mu::CuDeviceVector{UInt32},
+                            d_bad_off::CuDeviceVector{Int32},
+                            d_bad::CuDeviceVector{UInt8}, nprimes::Int32,
+                            kk::Int32)
+    g = (blockIdx().x - Int64(1)) * blockDim().x + threadIdx().x
+    total = ncyc * R
+    if g <= total
+        cyc = k_base + (g - Int64(1)) ÷ R
+        ridx = (g - Int64(1)) % R + Int64(1)
+        @inbounds r = d_wheel_n[ridx]
+        n = Int128(cyc) * Int128(wheel) + Int128(r)
+        if n > lo && n < hi
+            r_hi = UInt32((r >> 20) & 0x7FFFFFFF)
+            r_lo = UInt32(r & 0x00000000000FFFFF)
+            cyc32 = UInt32(cyc & 0x7FFFFFFF)
+            ok = true
+            @inbounds for pi in 1:nprimes
+                p = UInt32(d_primes[pi]); mu = d_mu[pi]
+                rhp = bmod(r_hi, p, mu)
+                rp = bmod(rhp * UInt32(d_pow20[pi]) + r_lo, p, mu)
+                cp = bmod(cyc32, p, mu)
+                np = bmod(cp * UInt32(d_wheel_mod[pi]) + rp, p, mu)
+                if d_bad[d_bad_off[pi] + Int64(np) + Int64(1)] != 0x00
+                    ok = false; break
+                end
+            end
+            if ok
+                x_lo = UInt64(n & Int128(0xFFFFFFFFFFFFFFFF))
+                x_hi = UInt64((n >> 64) & Int128(0xFFFFFFFFFFFFFFFF))
+                good = true
+                @inbounds for _ in 1:kk
+                    isp = if x_hi == UInt64(0) && x_lo <= 0x7FFFFFFFFFFFFFFF
+                        is_prime_mr(Int64(x_lo))
+                    else
+                        (x_hi > 0x7FFFFFFFFFFFFFFF) ? false : is_prime_mr128(x_lo, x_hi)
+                    end
+                    if !isp
+                        good = false; break
+                    end
+                    carry = (x_lo > 0x7FFFFFFFFFFFFFFF) ? UInt64(1) : UInt64(0)
+                    x_lo = x_lo << 1
+                    x_hi = (x_hi << 1) | carry
+                    if x_lo == UInt64(0)
+                        x_lo = 0xFFFFFFFFFFFFFFFF
+                        x_hi -= UInt64(1)
+                    else
+                        x_lo -= UInt64(1)
+                    end
+                end
+                if good
+                    idx = CUDA.atomic_add!(pointer(counter, 1), Int32(1)) + Int32(1)
+                    if idx <= cap
+                        @inbounds out[idx] = n
+                    end
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+# 篩専用 (第二種, Int128). 生存 n を d_surv に atomic 追記。
+function _cc_sieve_kernel128_2!(d_surv::CuDeviceVector{Int128},
+                            scnt::CuDeviceVector{Int32}, scap::Int32,
+                            d_wheel_n::CuDeviceVector{Int64}, R::Int64,
+                            wheel::Int64, k_base::Int64, ncyc::Int64,
+                            lo::Int128, hi::Int128,
+                            d_primes::CuDeviceVector{Int32},
+                            d_wheel_mod::CuDeviceVector{Int32},
+                            d_pow20::CuDeviceVector{Int32},
+                            d_mu::CuDeviceVector{UInt32},
+                            d_bad_off::CuDeviceVector{Int32},
+                            d_bad::CuDeviceVector{UInt8}, nprimes::Int32)
+    g = (blockIdx().x - Int64(1)) * blockDim().x + threadIdx().x
+    total = ncyc * R
+    if g <= total
+        cyc = k_base + (g - Int64(1)) ÷ R
+        ridx = (g - Int64(1)) % R + Int64(1)
+        @inbounds r = d_wheel_n[ridx]
+        n = Int128(cyc) * Int128(wheel) + Int128(r)
+        if n > lo && n < hi
+            r_hi = UInt32((r >> 20) & 0x7FFFFFFF)
+            r_lo = UInt32(r & 0x00000000000FFFFF)
+            cyc32 = UInt32(cyc & 0x7FFFFFFF)
+            ok = true
+            @inbounds for pi in 1:nprimes
+                p = UInt32(d_primes[pi]); mu = d_mu[pi]
+                rhp = bmod(r_hi, p, mu)
+                rp = bmod(rhp * UInt32(d_pow20[pi]) + r_lo, p, mu)
+                cp = bmod(cyc32, p, mu)
+                np = bmod(cp * UInt32(d_wheel_mod[pi]) + rp, p, mu)
+                if d_bad[d_bad_off[pi] + Int64(np) + Int64(1)] != 0x00
+                    ok = false; break
+                end
+            end
+            if ok
+                idx = CUDA.atomic_add!(pointer(scnt, 1), Int32(1)) + Int32(1)
+                idx <= scap && (@inbounds d_surv[idx] = n)
+            end
+        end
+    end
+    return nothing
+end
+
+# MR専用 (第二種, Int128). 生存候補 d_surv[1..scnt] のみ鎖MR (x=2x-1)。
+function _cc_mr_kernel128_2!(d_surv::CuDeviceVector{Int128},
+                            scnt::CuDeviceVector{Int32},
+                            out::CuDeviceVector{Int128},
+                            counter::CuDeviceVector{Int32}, cap::Int32, kk::Int32)
+    i = (blockIdx().x - Int64(1)) * blockDim().x + threadIdx().x
+    @inbounds nsurv = scnt[1]
+    if i <= nsurv
+        @inbounds n = d_surv[i]
+        x_lo = UInt64(n & Int128(0xFFFFFFFFFFFFFFFF))
+        x_hi = UInt64((n >> 64) & Int128(0xFFFFFFFFFFFFFFFF))
+        good = true
+        @inbounds for _ in 1:kk
+            isp = if x_hi == UInt64(0) && x_lo <= 0x7FFFFFFFFFFFFFFF
+                is_prime_mr(Int64(x_lo))
+            else
+                (x_hi > 0x7FFFFFFFFFFFFFFF) ? false : is_prime_mr128(x_lo, x_hi)
+            end
+            if !isp
+                good = false; break
+            end
+            carry = (x_lo > 0x7FFFFFFFFFFFFFFF) ? UInt64(1) : UInt64(0)
+            x_lo = x_lo << 1
+            x_hi = (x_hi << 1) | carry
+            if x_lo == UInt64(0)
+                x_lo = 0xFFFFFFFFFFFFFFFF
+                x_hi -= UInt64(1)
+            else
+                x_lo -= UInt64(1)
+            end
+        end
+        if good
+            idx = CUDA.atomic_add!(pointer(counter, 1), Int32(1)) + Int32(1)
+            if idx <= cap
+                @inbounds out[idx] = n
+            end
+        end
+    end
+    return nothing
+end
+
+# ストリーミング融合カーネル (第二種, Int128 頭)
+function _cc_wheel_kernel_stream128_2!(out::CuDeviceVector{Int128},
+        counter::CuDeviceVector{Int32}, cap::Int32,
+        d_contrib::CuDeviceVector{Int64}, d_contrib_off::CuDeviceVector{Int32},
+        d_bases::CuDeviceVector{Int64}, d_radixprod::CuDeviceVector{Int64},
+        w::Int32, wheel::Int64, k_start::Int64, R::Int64,
+        work_base::Int64, total_work::Int64,
+        lo::Int128, hi::Int128,
+        d_primes::CuDeviceVector{Int32}, d_wheel_mod::CuDeviceVector{Int32},
+        d_pow20::CuDeviceVector{Int32}, d_pow40::CuDeviceVector{Int32},
+        d_mu::CuDeviceVector{UInt32},
+        d_bad_off::CuDeviceVector{Int32}, d_bad::CuDeviceVector{UInt8},
+        nprimes::Int32, kk::Int32)
+    t = (blockIdx().x - Int64(1)) * blockDim().x + threadIdx().x
+    g = work_base + t - Int64(1)
+    if g < total_work
+        cyc = k_start + g ÷ R
+        sidx = g % R
+        r = Int64(0)
+        @inbounds for j in 1:w
+            ij = (sidx ÷ d_radixprod[j]) % d_bases[j]
+            r = (r + d_contrib[d_contrib_off[j] + ij + Int64(1)]) % wheel
+        end
+        n = Int128(cyc) * Int128(wheel) + Int128(r)
+        if n > lo && n < hi
+            r2 = UInt32((r >> 40) & 0x00000000000FFFFF)
+            r1 = UInt32((r >> 20) & 0x00000000000FFFFF)
+            r0 = UInt32(r & 0x00000000000FFFFF)
+            cyc32 = UInt32(cyc & 0x7FFFFFFF)
+            ok = true
+            @inbounds for pi in 1:nprimes
+                p = UInt32(d_primes[pi]); mu = d_mu[pi]
+                t2 = bmod(bmod(r2, p, mu) * UInt32(d_pow40[pi]), p, mu)
+                t1 = bmod(bmod(r1, p, mu) * UInt32(d_pow20[pi]) + r0, p, mu)
+                rp = bmod(t2 + t1, p, mu)
+                cp = bmod(cyc32, p, mu)
+                np = bmod(cp * UInt32(d_wheel_mod[pi]) + rp, p, mu)
+                if d_bad[d_bad_off[pi] + Int64(np) + Int64(1)] != 0x00
+                    ok = false; break
+                end
+            end
+            if ok
+                x_lo = UInt64(n & Int128(0xFFFFFFFFFFFFFFFF))
+                x_hi = UInt64((n >> 64) & Int128(0xFFFFFFFFFFFFFFFF))
+                good = true
+                @inbounds for _ in 1:kk
+                    isp = if x_hi == UInt64(0) && x_lo <= 0x7FFFFFFFFFFFFFFF
+                        is_prime_mr(Int64(x_lo))
+                    else
+                        (x_hi > 0x7FFFFFFFFFFFFFFF) ? false : is_prime_mr128(x_lo, x_hi)
+                    end
+                    if !isp
+                        good = false; break
+                    end
+                    carry = (x_lo > 0x7FFFFFFFFFFFFFFF) ? UInt64(1) : UInt64(0)
+                    x_lo = x_lo << 1
+                    x_hi = (x_hi << 1) | carry
+                    if x_lo == UInt64(0)
+                        x_lo = 0xFFFFFFFFFFFFFFFF
+                        x_hi -= UInt64(1)
+                    else
+                        x_lo -= UInt64(1)
+                    end
+                end
+                if good
+                    idx = CUDA.atomic_add!(pointer(counter, 1), Int32(1)) + Int32(1)
+                    if idx <= cap
+                        @inbounds out[idx] = n
+                    end
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+# ストリーミング篩専用 (第二種, Int128)
+function _cc_sieve_kernel_stream128_2!(d_surv::CuDeviceVector{Int128},
+        scnt::CuDeviceVector{Int32}, scap::Int32,
+        d_contrib::CuDeviceVector{Int64}, d_contrib_off::CuDeviceVector{Int32},
+        d_bases::CuDeviceVector{Int64}, d_radixprod::CuDeviceVector{Int64},
+        w::Int32, wheel::Int64, k_start::Int64, R::Int64,
+        work_base::Int64, total_work::Int64,
+        lo::Int128, hi::Int128,
+        d_primes::CuDeviceVector{Int32}, d_wheel_mod::CuDeviceVector{Int32},
+        d_pow20::CuDeviceVector{Int32}, d_pow40::CuDeviceVector{Int32},
+        d_mu::CuDeviceVector{UInt32},
+        d_bad_off::CuDeviceVector{Int32}, d_bad::CuDeviceVector{UInt8},
+        nprimes::Int32)
+    t = (blockIdx().x - Int64(1)) * blockDim().x + threadIdx().x
+    g = work_base + t - Int64(1)
+    if g < total_work
+        cyc = k_start + g ÷ R
+        sidx = g % R
+        r = Int64(0)
+        @inbounds for j in 1:w
+            ij = (sidx ÷ d_radixprod[j]) % d_bases[j]
+            r = (r + d_contrib[d_contrib_off[j] + ij + Int64(1)]) % wheel
+        end
+        n = Int128(cyc) * Int128(wheel) + Int128(r)
+        if n > lo && n < hi
+            r2 = UInt32((r >> 40) & 0x00000000000FFFFF)
+            r1 = UInt32((r >> 20) & 0x00000000000FFFFF)
+            r0 = UInt32(r & 0x00000000000FFFFF)
+            cyc32 = UInt32(cyc & 0x7FFFFFFF)
+            ok = true
+            @inbounds for pi in 1:nprimes
+                p = UInt32(d_primes[pi]); mu = d_mu[pi]
+                t2 = bmod(bmod(r2, p, mu) * UInt32(d_pow40[pi]), p, mu)
+                t1 = bmod(bmod(r1, p, mu) * UInt32(d_pow20[pi]) + r0, p, mu)
+                rp = bmod(t2 + t1, p, mu)
+                cp = bmod(cyc32, p, mu)
+                np = bmod(cp * UInt32(d_wheel_mod[pi]) + rp, p, mu)
+                if d_bad[d_bad_off[pi] + Int64(np) + Int64(1)] != 0x00
+                    ok = false; break
+                end
+            end
+            if ok
+                idx = CUDA.atomic_add!(pointer(scnt, 1), Int32(1)) + Int32(1)
+                idx <= scap && (@inbounds d_surv[idx] = n)
+            end
+        end
+    end
+    return nothing
+end
+# ============================================================
+# 第二種用 setup / scan / search
+#   GpuWheelState / GpuWheelStreamState は第一種と同一構造を再利用。
+#   篩 bad 残基のみ build_cc_sieve_2 / gpu_build_extra_2 / build_wheel_streaming_2 で構築。
+# ============================================================
+
+# セットアップ (第二種)
+function gpu_wheel_setup_2(k::Int; cap::Int = 1 << 16, max_prime::Int = 0,
+                          wl::Union{Nothing,Vector{Int}} = nothing, verbose::Bool = true)
+    if wl === nothing
+        wheel, wheel_n, mdllist = build_cc_sieve_2(k)
+    else
+        wheel, wheel_n = build_wheel_custom_2(k, wl)
+        mdllist = Tuple{Int,Set{Int}}[]
+    end
+    if max_prime > 0 || wl !== nothing
+        mp = max_prime > 0 ? max_prime : _default_max_prime(k)
+        wlset = wl === nothing ? _cc_wl(k) : wl
+        mdllist = gpu_build_extra_2(k, mp; wl = wlset)
+    end
+    R = Int64(length(wheel_n))
+    primes32, offsets, badflat = _flatten_bad_gpu(mdllist)
+    wheel_mod = Int32[Int32(mod(Int64(wheel), Int64(p))) for p in primes32]
+    pow20 = Int32[Int32(mod(Int64(1) << 20, Int64(p))) for p in primes32]
+    mu = _barrett_mu(primes32)
+    @assert wheel < (Int64(1) << 51) "wheel exceeds 2^51; 32bit分解の前提が崩れる (CC$k)"
+    verbose && println("  setup CC$(k)-2nd: R=$R primes=$(length(primes32)) wheel=$wheel")
+    return GpuWheelState(k, Int64(wheel), R,
+        CuArray(Int64.(wheel_n)), CuArray(primes32),
+        CuArray(wheel_mod), CuArray(pow20), CuArray(mu), CuArray(offsets),
+        CuArray(badflat), Int32(length(primes32)),
+        CUDA.zeros(Int64, cap), CUDA.zeros(Int32, 1), cap)
+end
+
+# 純スキャン (第二種, セットアップ済み state を使用)
+function gpu_wheel_scan_2!(st::GpuWheelState, lo::Integer, hi::Integer;
+                          work_tile::Int = 1 << 25, progress::Bool = false,
+                          threads::Int = 64)
+    lo64 = Int64(lo); hi64 = Int64(hi)
+    w64 = st.wheel
+    k_start = lo64 ÷ w64
+    k_end   = (hi64 - 1) ÷ w64
+    total_cyc = k_end - k_start + 1
+    results = Int64[]
+    cyc_per_launch = max(1, work_tile ÷ Int(st.R))
+    fill!(st.d_cnt, Int32(0))
+    t0 = time()
+    last_report = 0.0
+    cyc = k_start
+    while cyc <= k_end
+        ncyc = min(cyc_per_launch, k_end - cyc + 1)
+        work = ncyc * st.R
+        blocks = cld(work, threads)
+        @cuda threads=threads blocks=blocks _cc_wheel_kernel_2!(
+            st.d_out, st.d_cnt, Int32(st.cap), st.d_wheel_n, st.R, w64, cyc, ncyc,
+            lo64, hi64, st.d_primes, st.d_wheel_mod, st.d_pow20, st.d_mu,
+            st.d_bad_off, st.d_bad, st.nprimes, Int32(st.k))
+        cyc += ncyc
+        if progress
+            frac = (cyc - k_start) / total_cyc
+            now = time() - t0
+            if now - last_report > 15.0
+                CUDA.synchronize()
+                eta = frac > 0 ? now/frac*(1-frac) : 0.0
+                @info "  CC$(st.k)-2nd scan $(round(100*frac,digits=1))% | $(round(now,digits=0))s | ETA $(round(eta,digits=0))s | found=$(Array(st.d_cnt)[1])"
+                last_report = now
+            end
+        end
+    end
+    CUDA.synchronize()
+    cnt = Array(st.d_cnt)[1]
+    if cnt > 0
+        got = min(Int(cnt), st.cap)
+        append!(results, Array(view(st.d_out, 1:got)))
+    end
+    sort!(results)
+    return results
+end
+
+# 全部入りの便利関数 (第二種)
+function search_cc_gpu_wheel_2(lo::Integer, hi::Integer, k::Int;
+                              work_tile::Int = 1 << 25,
+                              cap::Int = 1 << 16,
+                              max_prime::Int = -1,
+                              progress::Bool = false,
+                              verbose::Bool = true)
+    mp = max_prime < 0 ? _default_max_prime(k) : max_prime
+    t0 = time()
+    st = gpu_wheel_setup_2(k; cap=cap, max_prime=mp, verbose=verbose)
+    results = gpu_wheel_scan_2!(st, lo, hi; work_tile=work_tile, progress=progress)
+    verbose && println("=== GPU-wheel CC$(k)-2nd: $(length(results)) in $(round(time()-t0,digits=3))s ===")
+    return results
+end
+
+# Int128 頭 スキャン (第二種, 巨大数域). setup済み state を使用。
+function gpu_wheel_scan128_2!(st::GpuWheelState, lo::Int128, hi::Int128;
+                             work_tile::Int = 1 << 25, cap::Int = 1 << 12,
+                             progress::Bool = false, threads::Int = 64,
+                             mr_threads::Int = 64, scap::Int = 1 << 20,
+                             drain_every::Int = 256)
+    w = Int128(st.wheel)
+    k_start = Int64(lo ÷ w)
+    k_end   = Int64((hi - Int128(1)) ÷ w)
+    @assert k_end < (Int64(1) << 31) "cyc>=2^31: 範囲が大きすぎ/wheelが小さすぎ (32bit篩の前提が崩れる)"
+    d_out = CUDA.zeros(Int128, cap)
+    d_cnt = CUDA.zeros(Int32, 1)
+    d_surv = CUDA.zeros(Int128, scap)
+    d_scnt = CUDA.zeros(Int32, 1)
+    mr_blocks = cld(scap, mr_threads)
+    cyc_per_launch = max(1, work_tile ÷ Int(st.R))
+    total_cyc = k_end - k_start + 1
+    t0 = time(); last_report = 0.0
+    cyc = k_start; tile = 0
+    while cyc <= k_end
+        ncyc = min(cyc_per_launch, k_end - cyc + 1)
+        work = ncyc * st.R
+        blocks = cld(work, threads)
+        @cuda threads=threads blocks=blocks _cc_sieve_kernel128_2!(
+            d_surv, d_scnt, Int32(scap), st.d_wheel_n, st.R, st.wheel, cyc, ncyc,
+            lo, hi, st.d_primes, st.d_wheel_mod, st.d_pow20, st.d_mu,
+            st.d_bad_off, st.d_bad, st.nprimes)
+        cyc += ncyc; tile += 1
+        if tile % drain_every == 0
+            @cuda threads=mr_threads blocks=mr_blocks _cc_mr_kernel128_2!(
+                d_surv, d_scnt, d_out, d_cnt, Int32(cap), Int32(st.k))
+            CUDA.fill!(d_scnt, Int32(0))
+        end
+        if progress
+            now = time() - t0
+            if now - last_report > 15.0
+                CUDA.synchronize()
+                @assert Array(d_scnt)[1] <= scap "survivor overflow: drain_every down か scap up"
+                frac = (cyc - k_start) / total_cyc
+                eta = frac > 0 ? now/frac*(1-frac) : 0.0
+                @info "  CC$(st.k)-2nd/128 $(round(100*frac,digits=1))% | $(round(now,digits=0))s | ETA $(round(eta,digits=0))s | found=$(Array(d_cnt)[1])"
+                last_report = now
+            end
+        end
+    end
+    @cuda threads=mr_threads blocks=mr_blocks _cc_mr_kernel128_2!(
+        d_surv, d_scnt, d_out, d_cnt, Int32(cap), Int32(st.k))
+    CUDA.synchronize()
+    cnt = Array(d_cnt)[1]
+    results = Int128[]
+    if cnt > 0
+        got = min(Int(cnt), cap)
+        append!(results, Array(view(d_out, 1:got)))
+    end
+    CUDA.unsafe_free!(d_out); CUDA.unsafe_free!(d_cnt)
+    CUDA.unsafe_free!(d_surv); CUDA.unsafe_free!(d_scnt)
+    sort!(results)
+    return results
+end
+
+# 全部入り (第二種, Int128 頭)
+function search_cc_gpu_wheel128_2(lo::Integer, hi::Integer, k::Int;
+                                 max_prime::Int = -1, progress::Bool = false,
+                                 verbose::Bool = true)
+    mp = max_prime < 0 ? _default_max_prime(k) : max_prime
+    t0 = time()
+    st = gpu_wheel_setup_2(k; max_prime=mp, verbose=verbose)
+    r = gpu_wheel_scan128_2!(st, Int128(lo), Int128(hi); progress=progress)
+    verbose && println("=== GPU-wheel128 CC$(k)-2nd: $(length(r)) in $(round(time()-t0,digits=3))s ===")
+    CUDA.unsafe_free!(st.d_out)
+    return r
+end
+
+# ストリーミング setup (第二種)
+function gpu_wheel_stream_setup_2(k::Int; wl::Vector{Int} = _cc_wl_stream(k),
+                                 max_prime::Int = -1, verbose::Bool = true)
+    wheel, contrib, contrib_off, bases, radixprod, R = build_wheel_streaming_2(k, wl)
+    mp = max_prime < 0 ? _default_max_prime(k) : max_prime
+    mdllist = gpu_build_extra_2(k, mp; wl = wl)
+    primes32, offsets, badflat = _flatten_bad_gpu(mdllist)
+    wheel_mod = Int32[Int32(mod(wheel, Int64(p))) for p in primes32]
+    pow20 = Int32[Int32(mod(Int64(1) << 20, Int64(p))) for p in primes32]
+    pow40 = Int32[Int32(mod(Int64(1) << 40, Int64(p))) for p in primes32]
+    mu = _barrett_mu(primes32)
+    if verbose
+        dens = R / wheel
+        println("  stream setup CC$(k)-2nd: R=$R density=$(round(dens, sigdigits=3)) primes=$(length(primes32)) wheel=$wheel")
+        println("    wl=$wl")
+    end
+    return GpuWheelStreamState(k, wheel, R, Int32(length(wl)),
+        CuArray(contrib), CuArray(contrib_off), CuArray(bases), CuArray(radixprod),
+        CuArray(primes32), CuArray(wheel_mod), CuArray(pow20), CuArray(pow40),
+        CuArray(mu), CuArray(offsets), CuArray(badflat), Int32(length(primes32)))
+end
+
+# ストリーミングスキャン (第二種, Int128 頭)
+function gpu_wheel_scan_stream128_2!(st::GpuWheelStreamState, lo::Int128, hi::Int128;
+        work_tile::Int = 1 << 25, cap::Int = 1 << 12, progress::Bool = false,
+        threads::Int = 64, mr_threads::Int = 64, scap::Int = 1 << 20,
+        drain_every::Int = 256)
+    w = Int128(st.wheel)
+    k_start = Int64(lo ÷ w)
+    k_end   = Int64((hi - Int128(1)) ÷ w)
+    @assert k_end < (Int64(1) << 31) "cyc>=2^31: 範囲が大きすぎ/wheelが小さすぎ (32bit篩の前提が崩れる)"
+    total_cyc = k_end - k_start + 1
+    total_work = total_cyc * st.R
+    d_out = CUDA.zeros(Int128, cap)
+    d_cnt = CUDA.zeros(Int32, 1)
+    d_surv = CUDA.zeros(Int128, scap)
+    d_scnt = CUDA.zeros(Int32, 1)
+    mr_blocks = cld(scap, mr_threads)
+    t0 = time(); last_report = 0.0
+    wb = Int64(0); tile = 0
+    while wb < total_work
+        nwork = min(Int64(work_tile), total_work - wb)
+        blocks = cld(nwork, threads)
+        @cuda threads=threads blocks=blocks _cc_sieve_kernel_stream128_2!(
+            d_surv, d_scnt, Int32(scap),
+            st.d_contrib, st.d_contrib_off, st.d_bases, st.d_radixprod,
+            st.w, st.wheel, k_start, st.R, wb, total_work,
+            lo, hi, st.d_primes, st.d_wheel_mod, st.d_pow20, st.d_pow40, st.d_mu,
+            st.d_bad_off, st.d_bad, st.nprimes)
+        wb += nwork; tile += 1
+        if tile % drain_every == 0
+            @cuda threads=mr_threads blocks=mr_blocks _cc_mr_kernel128_2!(
+                d_surv, d_scnt, d_out, d_cnt, Int32(cap), Int32(st.k))
+            CUDA.fill!(d_scnt, Int32(0))
+        end
+        if progress
+            now = time() - t0
+            if now - last_report > 15.0
+                CUDA.synchronize()
+                @assert Array(d_scnt)[1] <= scap "survivor overflow: drain_every down か scap up"
+                frac = wb / total_work
+                eta = frac > 0 ? now/frac*(1-frac) : 0.0
+                @info "  CC$(st.k)-2nd/stream $(round(100*frac,digits=1))% | $(round(now,digits=0))s | ETA $(round(eta,digits=0))s | found=$(Array(d_cnt)[1])"
+                last_report = now
+            end
+        end
+    end
+    @cuda threads=mr_threads blocks=mr_blocks _cc_mr_kernel128_2!(
+        d_surv, d_scnt, d_out, d_cnt, Int32(cap), Int32(st.k))
+    CUDA.synchronize()
+    cnt = Array(d_cnt)[1]
+    results = Int128[]
+    if cnt > 0
+        got = min(Int(cnt), cap)
+        append!(results, Array(view(d_out, 1:got)))
+    end
+    CUDA.unsafe_free!(d_out); CUDA.unsafe_free!(d_cnt)
+    CUDA.unsafe_free!(d_surv); CUDA.unsafe_free!(d_scnt)
+    sort!(results)
+    return results
+end
+
+# 全部入り (第二種, ストリーミング CRT, Int128 頭)
+function search_cc_gpu_wheel_stream128_2(lo::Integer, hi::Integer, k::Int;
+        wl::Vector{Int} = _cc_wl_stream(k), max_prime::Int = -1,
+        work_tile::Int = 1 << 25, progress::Bool = false, verbose::Bool = true)
+    t0 = time()
+    st = gpu_wheel_stream_setup_2(k; wl=wl, max_prime=max_prime, verbose=verbose)
+    r = gpu_wheel_scan_stream128_2!(st, Int128(lo), Int128(hi);
+                                   work_tile=work_tile, progress=progress)
+    verbose && println("=== GPU-stream128 CC$(k)-2nd: $(length(r)) in $(round(time()-t0,digits=3))s ===")
     return r
 end

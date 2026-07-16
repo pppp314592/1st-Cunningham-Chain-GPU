@@ -217,3 +217,117 @@ function search_cc(n0::Int128, n1::Int128, k::Int;
     verbose && println("=== Done: $(length(results)) CC$k in $(round(time()-t0, digits=2))s ===")
     return results
 end
+
+# ============================================================
+# 第二種カニンガム鎖 (p, 2p-1, 4p-3, ...) 対応
+#   v_j(n) = 2^j n - (2^j - 1)。bad 残基: n ≡ (2^j - 1)·(2^j)^{-1} (mod p)
+#   鎖の進行: x -> 2x - 1
+# ============================================================
+
+function bad_info_2(p::Int, k::Int)
+    residues = Int[]
+    exc = Int128[]
+    seen = Set{Int}()
+    for j in 0:(k-1)
+        a = powermod(2, j, p)
+        inva = invmod(a, p)
+        r = mod((a - 1) * inva, p)
+        if r ∉ seen
+            push!(seen, r)
+            push!(residues, r)
+            # v_j(n) = p  ⇔  n = (p + (a-1)) / a  (整数なら)
+            num = p + (a - 1)
+            if num % a == 0
+                push!(exc, Int128(num) ÷ a)
+            else
+                push!(exc, Int128(-1))
+            end
+        end
+    end
+    return BadInfo(p, residues, exc)
+end
+
+# 第二種鎖の本判定 (128bit 内)
+function is_cc128_2(n::Int128, k::Int)::Bool
+    x_lo = UInt64(n & 0xFFFFFFFFFFFFFFFF)
+    x_hi = UInt64((n >> 64) & 0xFFFFFFFFFFFFFFFF)
+    @inbounds for j in 1:k
+        if x_hi == 0 && x_lo <= 0x7FFFFFFFFFFFFFFF
+            is_prime_mr_cpu(Int64(x_lo)) || return false
+        else
+            x_hi > 0x7FFFFFFFFFFFFFFF && return false
+            is_prime_mr128_cpu(x_lo, x_hi) || return false
+        end
+        carry = (x_lo > 0x7FFFFFFFFFFFFFFF) ? UInt64(1) : UInt64(0)
+        x_lo = x_lo << 1
+        x_hi = (x_hi << 1) | carry
+        if x_lo == 0
+            x_lo = 0xFFFFFFFFFFFFFFFF
+            x_hi -= UInt64(1)
+        else
+            x_lo -= UInt64(1)
+        end
+    end
+    return true
+end
+
+# 第二種探索本体
+function search_cc_2(n0::Int128, n1::Int128, k::Int;
+                    P::Int=1_000_000,
+                    blocksize::Int=1<<26,
+                    gpu::Bool=false,
+                    verbose::Bool=true)
+    verbose && println("=== CC$k (2nd kind) search [$n0, $n1]  P=$P  blocksize=$blocksize  gpu=$gpu ===")
+    t0 = time()
+
+    plist = primes(P)
+    filter!(p -> p > 2, plist)
+    badlist = [bad_info_2(p, k) for p in plist]
+    verbose && println("  primes=$(length(badlist))")
+
+    results = Int128[]
+    nblocks = cld(Int(n1 - n0 + 1), blocksize)
+    done = Threads.Atomic{Int}(0)
+    alock = ReentrantLock()
+
+    ranges = collect(Iterators.partition(n0:blocksize:n1, max(1, nblocks ÷ Threads.nthreads())))
+
+    Threads.@threads for blk in ranges
+        local_res = Int128[]
+        for nb in blk
+            L = Int(min(blocksize, n1 - nb + 1))
+            L <= 0 && continue
+            sieve = block_sieve_mt(nb, L, badlist)
+            cands = Int128[]
+            sizehint!(cands, 1024)
+            for i in 0:(L-1)
+                sieve[i+1] || continue
+                n = nb + i
+                n == 2 && continue
+                push!(cands, n)
+            end
+            if !isempty(cands)
+                if gpu
+                    append!(local_res, cc_chain_test_gpu_2(cands, k))
+                else
+                    for n in cands
+                        is_cc128_2(n, k) && push!(local_res, n)
+                    end
+                end
+            end
+        end
+        if !isempty(local_res)
+            lock(alock) do; append!(results, local_res); end
+        end
+        nd = Threads.atomic_add!(done, 1) + 1
+        if verbose && (nd % max(1, length(ranges)÷10) == 0 || nd == length(ranges))
+            elapsed = round(time() - t0, digits=1)
+            pct = round(100 * nd / length(ranges), digits=1)
+            @info "  $(pct)% | found=$(length(results)) | $(elapsed)s"
+        end
+    end
+
+    sort!(results)
+    verbose && println("=== Done: $(length(results)) CC$k (2nd) in $(round(time()-t0, digits=2))s ===")
+    return results
+end

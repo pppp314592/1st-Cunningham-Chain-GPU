@@ -49,3 +49,50 @@ function cc_chain_test_gpu(cands::Vector{Int128}, k::Int)::Vector{Int128}
     res = Array(d_res)
     return cands[res .== 1]
 end
+
+# ============================================================
+# 第二種カニンガム鎖の GPU 判定 (鎖進行: x -> 2x - 1)
+# ============================================================
+
+function _cc_gpu_kernel_2!(res::CuDeviceVector{Int32},
+                          lo::CuDeviceVector{UInt64},
+                          hi::CuDeviceVector{UInt64},
+                          kk::Int32)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if i <= length(lo)
+        x_lo = lo[i]; x_hi = hi[i]
+        ok = true
+        @inbounds for j in 1:kk
+            if x_hi == 0x0000000000000000 && x_lo <= 0x7FFFFFFFFFFFFFFF
+                is_prime_mr(Int64(x_lo)) || (ok = false; break)
+            else
+                (x_hi > 0x7FFFFFFFFFFFFFFF) && (ok = false; break)
+                is_prime_mr128(x_lo, x_hi) || (ok = false; break)
+            end
+            carry = (x_lo > 0x7FFFFFFFFFFFFFFF) ? UInt64(1) : UInt64(0)
+            x_lo = x_lo << 1
+            x_hi = (x_hi << 1) | carry
+            if x_lo == 0
+                x_lo = 0xFFFFFFFFFFFFFFFF
+                x_hi -= UInt64(1)
+            else
+                x_lo -= UInt64(1)
+            end
+        end
+        res[i] = ok ? Int32(1) : Int32(0)
+    end
+    return nothing
+end
+
+function cc_chain_test_gpu_2(cands::Vector{Int128}, k::Int)::Vector{Int128}
+    isempty(cands) && return Int128[]
+    d_lo = CuArray(UInt64.(cands .& 0xFFFFFFFFFFFFFFFF))
+    d_hi = CuArray(UInt64.((cands .>> 64) .& 0xFFFFFFFFFFFFFFFF))
+    d_res = CUDA.fill(Int32(0), length(cands))
+
+    threads = 256
+    blocks = cld(length(cands), threads)
+    @cuda threads=threads blocks=blocks _cc_gpu_kernel_2!(d_res, d_lo, d_hi, Int32(k))
+    res = Array(d_res)
+    return cands[res .== 1]
+end

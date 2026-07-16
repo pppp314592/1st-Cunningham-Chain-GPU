@@ -1,4 +1,4 @@
-# cc_cpu.jl — CPU-only 第一カニンガム鎖探索
+﻿# cc_cpu.jl — CPU-only 第一カニンガム鎖探索
 # マルチスレッド wheel 篩 + Miller-Rabin
 # Int64 / Int128 両対応
 
@@ -1545,3 +1545,366 @@ function search_cc_cpu_batch(lo::Int128, hi::Int128, target_cc::Int;
 end
 
 
+
+
+# ============================================================
+# 第二種カニンガム鎖 (p, 2p-1, 4p-3, ...) 対応
+#   鎖進行: x -> 2x - 1 (第一種の x -> 2x + 1 の符号反転)。
+#   篩ワーカー/フィルタ/MR は第一種と共有 (bad_flags さえ第二種用なら)。
+# ============================================================
+
+# 第二種チェイン長カウント (Int64)
+function cc_count_cpu_2(n::Int64, target_cc::Int)::Int
+    x = n
+    @inbounds for i in 1:target_cc
+        is_prime_mr_cpu(x) || return i - 1
+        i == target_cc && return target_cc
+        x = 2x - 1
+        x <= 0 && return i
+    end
+    return target_cc
+end
+
+# 第二種チェイン長カウント (Int128): 鎖の進行は x -> 2x - 1
+function cc_count128_cpu_2(lo::UInt64, hi::UInt64, target_cc::Int)::Int
+    x_lo, x_hi = lo, hi
+    @inbounds for i in 1:target_cc
+        if x_hi > 0x7FFFFFFFFFFFFFFF
+            return i - 1
+        end
+        if x_hi == 0 && x_lo <= 0x7FFFFFFFFFFFFFFF
+            is_prime_mr_cpu(Int64(x_lo)) || return i - 1
+        else
+            is_prime_mr128_cpu(x_lo, x_hi) || return i - 1
+        end
+        i == target_cc && return target_cc
+        carry = (x_lo > 0x7FFFFFFFFFFFFFFF) ? UInt64(1) : UInt64(0)
+        x_lo = x_lo << 1
+        x_hi = (x_hi << 1) | carry
+        if x_lo == 0
+            x_lo = 0xFFFFFFFFFFFFFFFF
+            x_hi -= UInt64(1)
+        else
+            x_lo -= UInt64(1)
+        end
+    end
+    return target_cc
+end
+
+# 第二種篩構築: bad 残基を y = (2y - 1) % p で計算
+function build_cc_sieve_2(target_cc::Int)
+    wl = if target_cc ≤ 9
+        [2,3,5,7,11,13,17]
+    elseif target_cc ≤ 11
+        [2,3,5,7,11,13,17,19,23]
+    elseif target_cc ≤ 13
+        [2,3,5,7,11,13,17,19,23,37,41]
+    else
+        [2,3,5,7,11,13,17,19,23,37,41,43]
+    end
+    wheel = prod(wl)
+
+    function cc_len_mod_2(x::Int, p::Int, target_cc::Int)::Int
+        n = 0
+        y = x
+        while n < target_cc && y % p != 0
+            y = (2y - 1) % p
+            n += 1
+        end
+        return n
+    end
+
+    modsieve_wl = [(p, Set(i for i in 0:p-1 if cc_len_mod_2(i, p, target_cc) < target_cc)) for p in wl]
+
+    wheel_n = Int[1]
+    pprod = 1
+    for (p, badset) in modsieve_wl
+        tmp = copy(wheel_n)
+        wheel_n = Int[]
+        for i in 0:p-1
+            append!(wheel_n, filter(x -> x % p ∉ badset, tmp .+ i * pprod))
+        end
+        pprod *= p
+    end
+    eff = wheel ÷ length(wheel_n)
+    println("CC$(target_cc) sieve(2nd): wheel=$(wheel) residues=$(length(wheel_n)) efficiency=$(eff)")
+
+    max_prime = if target_cc ≤ 12
+        1000
+    elseif target_cc ≤ 13
+        3000
+    else
+        5000
+    end
+    extra_primes = filter(p -> !(p in wl) && p ≤ max_prime, primes(max_prime))
+    mdllist = [(p, Set(i for i in 0:p-1 if cc_len_mod_2(i, p, target_cc) < target_cc)) for p in extra_primes]
+
+    return wheel, wheel_n, mdllist
+end
+
+# 第二種フィルタ (Int64)
+function _filter_cc64_2(candidates::Vector{Int}, target_cc::Int)::Vector{Int}
+    isempty(candidates) && return Int[]
+    n = length(candidates)
+    results = Int[]
+    rlock = ReentrantLock()
+    nt = min(Threads.nthreads(), n)
+    chunk = cld(n, nt)
+    Threads.@threads for tid in 1:nt
+        s = (tid - 1) * chunk + 1
+        e = min(tid * chunk, n)
+        local_res = Int[]
+        for i in s:e
+            if cc_count_cpu_2(candidates[i], target_cc) == target_cc
+                push!(local_res, candidates[i])
+            end
+        end
+        if !isempty(local_res)
+            lock(rlock) do; append!(results, local_res); end
+        end
+    end
+    return sort!(results)
+end
+
+# 第二種フィルタ (Int128)
+function _filter_cc128_2(candidates::Vector{Int128}, target_cc::Int)::Vector{Int128}
+    isempty(candidates) && return Int128[]
+    n = length(candidates)
+    results = Int128[]
+    rlock = ReentrantLock()
+    nt = min(Threads.nthreads(), n)
+    chunk = cld(n, nt)
+    Threads.@threads for tid in 1:nt
+        s = (tid - 1) * chunk + 1
+        e = min(tid * chunk, n)
+        local_res = Int128[]
+        for i in s:e
+            val = candidates[i]
+            if val <= typemax(Int64)
+                if cc_count_cpu_2(Int64(val), target_cc) == target_cc
+                    push!(local_res, val)
+                end
+            else
+                lo = UInt64(val & 0xFFFFFFFFFFFFFFFF)
+                hi = UInt64((val >> 64) & 0xFFFFFFFFFFFFFFFF)
+                if cc_count128_cpu_2(lo, hi, target_cc) == target_cc
+                    push!(local_res, val)
+                end
+            end
+        end
+        if !isempty(local_res)
+            lock(rlock) do; append!(results, local_res); end
+        end
+    end
+    return sort!(results)
+end
+
+# 第二種本体探索 (Int64)
+function search_cc_cpu_2(lo::Int64, hi::Int64, target_cc::Int; verbose::Bool=true)
+    verbose && println("=== CC$(target_cc) CPU-2nd search [$(lo), $(hi)] ===")
+    t_start = time()
+    wheel, wheel_n, mdllist = build_cc_sieve_2(target_cc)
+    primes_list, bad_flags = _flatten_badflags(mdllist)
+    k_start = lo ÷ wheel
+    k_end = (hi - 1) ÷ wheel
+    total_cycles = k_end - k_start + 1
+    verbose && println("  cycles=$(total_cycles) threads=$(Threads.nthreads())")
+    nt = Threads.nthreads()
+    chunk = max(1, total_cycles ÷ nt)
+    ranges = NTuple{2, Int64}[]
+    for t in 1:nt
+        ks = k_start + (t - 1) * chunk
+        ke = (t == nt) ? k_end : min(ks + chunk - 1, k_end)
+        ks > ke && break
+        push!(ranges, (ks, ke))
+    end
+    all_candidates = Int[]
+    alock = ReentrantLock()
+    done = Threads.Atomic{Int}(0)
+    n_ranges = length(ranges)
+    Threads.@threads for ri in 1:n_ranges
+        ks, ke = ranges[ri]
+        cand = _sieve_worker64(ks, ke, wheel, wheel_n, lo, hi, primes_list, bad_flags)
+        if !isempty(cand)
+            lock(alock) do; append!(all_candidates, cand); end
+        end
+        if verbose
+            nd = Threads.atomic_add!(done, 1) + 1
+            if nd % max(1, total_cycles ÷ 20) == 0 || nd == n_ranges
+                elapsed = round(time() - t_start, digits=1)
+                pct = round(100 * nd / n_ranges, digits=1)
+                @info "  sieve: $(pct)% | candidates=$(length(all_candidates)) | $(elapsed)s"
+            end
+        end
+    end
+    verbose && @info "  sieve done: $(length(all_candidates)) candidates in $(round(time() - t_start, digits=2))s"
+    results = _filter_cc64_2(all_candidates, target_cc)
+    t_end = time()
+    verbose && println("=== Done: $(length(results)) CC$(target_cc) in $(round(t_end - t_start, digits=2))s ===")
+    if verbose
+        for r in results
+            println("CC$(target_cc): $r")
+        end
+    end
+    return results
+end
+
+# 第二種本体探索 (Int128)
+function search_cc_cpu_2(lo::Int128, hi::Int128, target_cc::Int; verbose::Bool=true)
+    verbose && println("=== CC$(target_cc) CPU-2nd search (Int128) [$(lo), $(hi)] ===")
+    t_start = time()
+    wheel, wheel_n, mdllist = build_cc_sieve_2(target_cc)
+    primes_list, bad_flags = _flatten_badflags(mdllist)
+    w128 = Int128(wheel)
+    k_start = lo ÷ w128
+    k_end = (hi - 1) ÷ w128
+    total_cycles = k_end - k_start + 1
+    verbose && println("  cycles=$(total_cycles) threads=$(Threads.nthreads())")
+    nt = Threads.nthreads()
+    chunk = max(1, total_cycles ÷ nt)
+    ranges = NTuple{2, Int128}[]
+    for t in 1:nt
+        ks = k_start + (t - 1) * chunk
+        ke = (t == nt) ? k_end : min(ks + chunk - 1, k_end)
+        ks > ke && break
+        push!(ranges, (ks, ke))
+    end
+    all_candidates = Int128[]
+    alock = ReentrantLock()
+    done = Threads.Atomic{Int}(0)
+    n_ranges = length(ranges)
+    Threads.@threads for ri in 1:n_ranges
+        ks, ke = ranges[ri]
+        cand = _sieve_worker128(ks, ke, wheel, wheel_n, lo, hi, primes_list, bad_flags)
+        if !isempty(cand)
+            lock(alock) do; append!(all_candidates, cand); end
+        end
+        if verbose
+            nd = Threads.atomic_add!(done, 1) + 1
+            if nd % max(1, n_ranges ÷ 10) == 0 || nd == n_ranges
+                elapsed = round(time() - t_start, digits=1)
+                pct = round(100 * nd / n_ranges, digits=1)
+                @info "  sieve: $(pct)% | candidates=$(length(all_candidates)) | $(elapsed)s"
+            end
+        end
+    end
+    verbose && @info "  sieve done: $(length(all_candidates)) candidates in $(round(time() - t_start, digits=2))s"
+    results = _filter_cc128_2(all_candidates, target_cc)
+    t_end = time()
+    verbose && println("=== Done: $(length(results)) CC$(target_cc) in $(round(t_end - t_start, digits=2))s ===")
+    if verbose
+        for r in results
+            println("CC$(target_cc): $r")
+        end
+    end
+    return results
+end
+
+# 第二種本体探索 (Int64) — バッチ処理版
+function search_cc_cpu_batch_2(lo::Int64, hi::Int64, target_cc::Int;
+                               N_pre::Int=10, B::Int=2048, verbose::Bool=true)
+    verbose && println("=== CC$(target_cc) CPU-batch-2nd [$(lo), $(hi)] (N=$N_pre, B=$B) ===")
+    t_start = time()
+    wheel, wheel_n, mdllist = build_cc_sieve_2(target_cc)
+    primes_list, bad_flags = _flatten_badflags(mdllist)
+    k_start = lo ÷ wheel
+    k_end = (hi - 1) ÷ wheel
+    total_cycles = k_end - k_start + 1
+    verbose && println("  cycles=$(total_cycles) threads=$(Threads.nthreads()) wheel_n=$(length(wheel_n))")
+    nt = Threads.nthreads()
+    chunk = max(1, total_cycles ÷ nt)
+    ranges = NTuple{2, Int64}[]
+    for t in 1:nt
+        ks = k_start + (t - 1) * chunk
+        ke = (t == nt) ? k_end : min(ks + chunk - 1, k_end)
+        ks > ke && break
+        push!(ranges, (ks, ke))
+    end
+    N = min(N_pre, length(primes_list))
+    mods = N > 0 ? _build_mods_matrix(wheel_n, primes_list, N) : Matrix{UInt16}(undef, 0, 0)
+    all_candidates = Int[]
+    alock = ReentrantLock()
+    done = Threads.Atomic{Int}(0)
+    n_ranges = length(ranges)
+    Threads.@threads for ri in 1:n_ranges
+        ks, ke = ranges[ri]
+        cand = _sieve_worker64_batch(ks, ke, wheel, wheel_n, lo, hi,
+                                     primes_list, bad_flags; N_pre=N_pre, B=B, mods=mods)
+        if !isempty(cand)
+            lock(alock) do; append!(all_candidates, cand); end
+        end
+        if verbose
+            nd = Threads.atomic_add!(done, 1) + 1
+            if nd % max(1, n_ranges ÷ 10) == 0 || nd == n_ranges
+                elapsed = round(time() - t_start, digits=1)
+                pct = round(100 * nd / n_ranges, digits=1)
+                @info "  sieve-batch: $(pct)% | candidates=$(length(all_candidates)) | $(elapsed)s"
+            end
+        end
+    end
+    verbose && @info "  sieve done: $(length(all_candidates)) candidates in $(round(time() - t_start, digits=2))s"
+    results = _filter_cc64_2(all_candidates, target_cc)
+    t_end = time()
+    verbose && println("=== Done: $(length(results)) CC$(target_cc) in $(round(t_end - t_start, digits=2))s ===")
+    if verbose
+        for r in results
+            println("CC$(target_cc): $r")
+        end
+    end
+    return results
+end
+
+# 第二種本体探索 (Int128) — バッチ処理版
+function search_cc_cpu_batch_2(lo::Int128, hi::Int128, target_cc::Int;
+                               N_pre::Int=10, B::Int=2048, verbose::Bool=true)
+    verbose && println("=== CC$(target_cc) CPU-batch-2nd (Int128) [$(lo), $(hi)] (N=$N_pre, B=$B) ===")
+    t_start = time()
+    wheel, wheel_n, mdllist = build_cc_sieve_2(target_cc)
+    primes_list, bad_flags = _flatten_badflags(mdllist)
+    w128 = Int128(wheel)
+    k_start = lo ÷ w128
+    k_end = (hi - 1) ÷ w128
+    total_cycles = k_end - k_start + 1
+    verbose && println("  cycles=$(total_cycles) threads=$(Threads.nthreads()) wheel_n=$(length(wheel_n))")
+    nt = Threads.nthreads()
+    chunk = max(1, total_cycles ÷ nt)
+    ranges = NTuple{2, Int128}[]
+    for t in 1:nt
+        ks = k_start + (t - 1) * chunk
+        ke = (t == nt) ? k_end : min(ks + chunk - 1, k_end)
+        ks > ke && break
+        push!(ranges, (ks, ke))
+    end
+    N = min(N_pre, length(primes_list))
+    mods = N > 0 ? _build_mods_matrix(wheel_n, primes_list, N) : Matrix{UInt16}(undef, 0, 0)
+    all_candidates = Int128[]
+    alock = ReentrantLock()
+    done = Threads.Atomic{Int}(0)
+    n_ranges = length(ranges)
+    Threads.@threads for ri in 1:n_ranges
+        ks, ke = ranges[ri]
+        cand = _sieve_worker128_batch(ks, ke, wheel, wheel_n, lo, hi,
+                                      primes_list, bad_flags; N_pre=N_pre, B=B, mods=mods)
+        if !isempty(cand)
+            lock(alock) do; append!(all_candidates, cand); end
+        end
+        if verbose
+            nd = Threads.atomic_add!(done, 1) + 1
+            if nd % max(1, n_ranges ÷ 10) == 0 || nd == n_ranges
+                elapsed = round(time() - t_start, digits=1)
+                pct = round(100 * nd / n_ranges, digits=1)
+                @info "  sieve-batch: $(pct)% | candidates=$(length(all_candidates)) | $(elapsed)s"
+            end
+        end
+    end
+    verbose && @info "  sieve done: $(length(all_candidates)) candidates in $(round(time() - t_start, digits=2))s"
+    results = _filter_cc128_2(all_candidates, target_cc)
+    t_end = time()
+    verbose && println("=== Done: $(length(results)) CC$(target_cc) in $(round(t_end - t_start, digits=2))s ===")
+    if verbose
+        for r in results
+            println("CC$(target_cc): $r")
+        end
+    end
+    return results
+end
