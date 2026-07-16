@@ -242,11 +242,10 @@ function cc_count_cpu(n::Int64, target_cc::Int)::Int
     x = n
     @inbounds for i in 1:target_cc
         is_prime_mr_cpu(x) || return i - 1
-        i == target_cc && return target_cc
         x = 2x + 1
-        x <= n && return i  # overflow
+        x <= n && return i
     end
-    return target_cc
+    return is_prime_mr_cpu(x) ? target_cc + 1 : target_cc
 end
 
 function cc_count128_cpu(lo::UInt64, hi::UInt64, target_cc::Int)::Int
@@ -260,12 +259,18 @@ function cc_count128_cpu(lo::UInt64, hi::UInt64, target_cc::Int)::Int
         else
             is_prime_mr128_cpu(x_lo, x_hi) || return i - 1
         end
-        i == target_cc && return target_cc
         carry = (x_lo > 0x7FFFFFFFFFFFFFFF) ? UInt64(1) : UInt64(0)
         x_lo = (x_lo << 1) | UInt64(1)
         x_hi = (x_hi << 1) | carry
     end
-    return target_cc
+    if x_hi > 0x7FFFFFFFFFFFFFFF
+        return target_cc
+    end
+    if x_hi == 0 && x_lo <= 0x7FFFFFFFFFFFFFFF
+        return is_prime_mr_cpu(Int64(x_lo)) ? target_cc + 1 : target_cc
+    else
+        return is_prime_mr128_cpu(x_lo, x_hi) ? target_cc + 1 : target_cc
+    end
 end
 
 # ============================================================
@@ -952,7 +957,7 @@ function _filter_cc64(candidates::Vector{Int}, target_cc::Int)::Vector{Int}
         e = min(tid * chunk, n)
         local_res = Int[]
         for i in s:e
-            if cc_count_cpu(candidates[i], target_cc) == target_cc
+            if cc_count_cpu(candidates[i], target_cc) >= target_cc
                 push!(local_res, candidates[i])
             end
         end
@@ -984,13 +989,13 @@ function _filter_cc128(candidates::Vector{Int128}, target_cc::Int)::Vector{Int12
         for i in s:e
             val = candidates[i]
             if val <= typemax(Int64)
-                if cc_count_cpu(Int64(val), target_cc) == target_cc
+                if cc_count_cpu(Int64(val), target_cc) >= target_cc
                     push!(local_res, val)
                 end
             else
                 lo = UInt64(val & 0xFFFFFFFFFFFFFFFF)
                 hi = UInt64((val >> 64) & 0xFFFFFFFFFFFFFFFF)
-                if cc_count128_cpu(lo, hi, target_cc) == target_cc
+                if cc_count128_cpu(lo, hi, target_cc) >= target_cc
                     push!(local_res, val)
                 end
             end
@@ -1558,11 +1563,10 @@ function cc_count_cpu_2(n::Int64, target_cc::Int)::Int
     x = n
     @inbounds for i in 1:target_cc
         is_prime_mr_cpu(x) || return i - 1
-        i == target_cc && return target_cc
         x = 2x - 1
         x <= 0 && return i
     end
-    return target_cc
+    return is_prime_mr_cpu(x) ? target_cc + 1 : target_cc
 end
 
 # 第二種チェイン長カウント (Int128): 鎖の進行は x -> 2x - 1
@@ -1577,7 +1581,6 @@ function cc_count128_cpu_2(lo::UInt64, hi::UInt64, target_cc::Int)::Int
         else
             is_prime_mr128_cpu(x_lo, x_hi) || return i - 1
         end
-        i == target_cc && return target_cc
         carry = (x_lo > 0x7FFFFFFFFFFFFFFF) ? UInt64(1) : UInt64(0)
         x_lo = x_lo << 1
         x_hi = (x_hi << 1) | carry
@@ -1588,7 +1591,14 @@ function cc_count128_cpu_2(lo::UInt64, hi::UInt64, target_cc::Int)::Int
             x_lo -= UInt64(1)
         end
     end
-    return target_cc
+    if x_hi > 0x7FFFFFFFFFFFFFFF
+        return target_cc
+    end
+    if x_hi == 0 && x_lo <= 0x7FFFFFFFFFFFFFFF
+        return is_prime_mr_cpu(Int64(x_lo)) ? target_cc + 1 : target_cc
+    else
+        return is_prime_mr128_cpu(x_lo, x_hi) ? target_cc + 1 : target_cc
+    end
 end
 
 # 第二種篩構築: bad 残基を y = (2y - 1) % p で計算
@@ -1655,7 +1665,7 @@ function _filter_cc64_2(candidates::Vector{Int}, target_cc::Int)::Vector{Int}
         e = min(tid * chunk, n)
         local_res = Int[]
         for i in s:e
-            if cc_count_cpu_2(candidates[i], target_cc) == target_cc
+            if cc_count_cpu_2(candidates[i], target_cc) >= target_cc
                 push!(local_res, candidates[i])
             end
         end
@@ -1681,13 +1691,13 @@ function _filter_cc128_2(candidates::Vector{Int128}, target_cc::Int)::Vector{Int
         for i in s:e
             val = candidates[i]
             if val <= typemax(Int64)
-                if cc_count_cpu_2(Int64(val), target_cc) == target_cc
+                if cc_count_cpu_2(Int64(val), target_cc) >= target_cc
                     push!(local_res, val)
                 end
             else
                 lo = UInt64(val & 0xFFFFFFFFFFFFFFFF)
                 hi = UInt64((val >> 64) & 0xFFFFFFFFFFFFFFFF)
-                if cc_count128_cpu_2(lo, hi, target_cc) == target_cc
+                if cc_count128_cpu_2(lo, hi, target_cc) >= target_cc
                     push!(local_res, val)
                 end
             end

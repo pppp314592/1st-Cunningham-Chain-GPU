@@ -1,4 +1,4 @@
-include("algorithms/A8_bpsw.jl")
+include("../algorithms/A8_bpsw.jl")
 
 function chain_len(n::BigInt)
     m = n + 1
